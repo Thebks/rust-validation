@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/rust-zod-core",
+    # "crates/rust-zod-wasm",
+    # "crates/rust-zod-actix",
+    # "tools/zodify",
+]
+
+resolver = "2"
+
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.16"
+regex = "1.10"
