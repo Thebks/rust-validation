@@ -1,4 +1,5 @@
 // use proptest::array;
+use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -40,9 +41,9 @@ pub enum Schema {
 pub struct ValidationError {
     pub path: Vec<PathSegment>,
     pub code: ErrorCode,
-    pub message: String,
-    pub expected: Option<String>,
-    pub received: Option<String>,
+    pub message: String, // to change it back to normal just leave this and delete the rest
+    pub expected: Option<Value>,
+    pub received: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,97 +209,187 @@ impl ArrayBuilder {
     }
 }
 
-pub fn validate(schema: &Schema, value: &Value) -> Result<(), ValidationError> {
+fn validate_recursive(
+    schema: &Schema,
+    value: &Value,
+    path: &mut Vec<PathSegment>,
+    errors: &mut Vec<ValidationError>,
+) {
     match (schema, value) {
         (Schema::String(string_schema), Value::String(s)) => {
             if let Some(min) = string_schema.min_length {
                 if s.len() < min {
-                    return Err(ValidationError {
-                        message: format!("String is shorter that min_length {}", min),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::MinLength,
+                        message: format!("String must be at least {} characters", min),
+                        expected: Some(json!({"min": min})),
+                        received: Some(json!(s)),
                     });
                 }
             }
             if let Some(max) = string_schema.max_length {
                 if s.len() > max {
-                    return Err(ValidationError {
-                        message: format!("String is longer than max_length {}", max),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::MaxLength,
+                        message: format!("String must be at most {} characters", max),
+                        expected: Some(json!({"max": max})),
+                        received: Some(json!(s)),
                     });
                 }
             }
-            Ok(())
         }
 
         (Schema::Number(number_schema), Value::Number(n)) => {
             let num = n.as_f64().unwrap();
             if let Some(min) = number_schema.min {
                 if num < min {
-                    return Err(ValidationError {
-                        message: format!("Number is less than min {}", min),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::Min,
+                        message: format!("Number must be at least {}", min),
+                        expected: Some(json!({"min": min})),
+                        received: Some(json!(num)),
                     });
                 }
             }
             if let Some(max) = number_schema.max {
                 if num > max {
-                    return Err(ValidationError {
-                        message: format!("Number is greater than max {}", max),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::Max,
+                        message: format!("Number must be at most {}", max),
+                        expected: Some(json!({"max": max})),
+                        received: Some(json!(num)),
                     });
                 }
             }
-            Ok(())
+        }
+
+        (Schema::Boolean, Value::Bool(_)) => {
+            // Boolean always valid if type matches
         }
 
         (Schema::Object(object_schema), Value::Object(obj)) => {
             // Check required properties
             for required_key in &object_schema.required {
                 if !obj.contains_key(required_key) {
-                    return Err(ValidationError {
-                        message: format!("Missing required property: {}", required_key),
+                    path.push(PathSegment::Key(required_key.clone()));
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::Required,
+                        message: format!("Required property '{}' is missing", required_key),
+                        expected: None,
+                        received: None,
                     });
+                    path.pop();
                 }
             }
 
             // Validate each property
-            for (key, value) in obj {
+            for (key, val) in obj {
+                path.push(PathSegment::Key(key.clone()));
+
                 if let Some(prop_schema) = object_schema.properties.get(key) {
-                    validate(prop_schema, value)?
+                    validate_recursive(prop_schema, val, path, errors);
                 } else if !object_schema.additional_properties {
-                    return Err(ValidationError {
-                        message: format!("Unexpected property: {}", key),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::AdditionalProperty,
+                        message: format!("Additional property '{}' is not allowed", key),
+                        expected: None,
+                        received: Some(val.clone()),
                     });
                 }
+
+                path.pop();
             }
-            Ok(())
         }
 
         (Schema::Array(array_schema), Value::Array(arr)) => {
+            // Check min/max items
             if let Some(min) = array_schema.min_items {
                 if arr.len() < min {
-                    return Err(ValidationError {
-                        message: format!("Array has fewer items than min_items {}", min),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::MinItems,
+                        message: format!("Array must have at least {} items", min),
+                        expected: Some(json!({"minItems": min})),
+                        received: Some(json!(arr.len())),
                     });
                 }
             }
 
             if let Some(max) = array_schema.max_items {
                 if arr.len() > max {
-                    return Err(ValidationError {
-                        message: format!("Array has more items than max_items {}", max),
+                    errors.push(ValidationError {
+                        path: path.clone(),
+                        code: ErrorCode::MaxItems,
+                        message: format!("Array must have at most {} items", max),
+                        expected: Some(json!({"maxItems": max})),
+                        received: Some(json!(arr.len())),
                     });
                 }
             }
+
+            // Validate each item
             if let Some(item_schema) = &array_schema.items {
-                for item in arr {
-                    validate(item_schema, item)?
+                for (i, item) in arr.iter().enumerate() {
+                    path.push(PathSegment::Index(i));
+                    validate_recursive(item_schema, item, path, errors);
+                    path.pop();
                 }
             }
-            Ok(())
         }
 
-        // (Schema::Number, Value::Number(_)) => Ok(()),
-        (Schema::Boolean, Value::Bool(_)) => Ok(()),
-        _ => Err(ValidationError {
-            message: format!("Expected {:?}, got {:?}", schema, value),
-        }),
+        _ => {
+            errors.push(ValidationError {
+                path: path.clone(),
+                code: ErrorCode::InvalidType,
+                message: format!(
+                    "Expected {:?}, received {:?}",
+                    schema_type_name(schema),
+                    value_type_name(value)
+                ),
+                expected: None,
+                received: Some(value.clone()),
+            });
+        }
+    }
+}
+
+fn schema_type_name(schema: &Schema) -> &'static str {
+    match schema {
+        Schema::String(_) => "string",
+        Schema::Number(_) => "number",
+        Schema::Boolean => "boolean",
+        Schema::Object(_) => "object",
+        Schema::Array(_) => "array",
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::Null => "null",
+    }
+}
+
+pub fn validate(schema: &Schema, value: &Value) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    let mut path = Vec::new();
+
+    validate_recursive(schema, value, &mut path, &mut errors);
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -352,7 +443,7 @@ mod tests {
         });
         let result = validate(&schema, &missing);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("name"));
+        assert!(result.unwrap_err()[0].message.contains("name"));
 
         // Invalid property type
         let invalid = json!({
@@ -411,5 +502,66 @@ mod tests {
             {"age": 30}  // missing name
         ]);
         assert!(validate(&schema, &invalid).is_err());
+    }
+
+    #[test]
+    fn test_multiple_errors() {
+        let schema = Schema::object()
+            .property("name", Schema::string().min_length(5).build())
+            .property("age", Schema::number().min(18.0).build())
+            .required("name")
+            .required("age")
+            .build();
+
+        let data = json!({
+            "name": "Jo",  // Too short (error 1)
+            "age": 10.0    // Too young (error 2)
+        });
+
+        let result = validate(&schema, &data);
+        assert!(result.is_err());
+
+        let errors = result.unwrap_err();
+        println!("Found {} errors:", errors.len());
+        for error in &errors {
+            println!("  - {:?}: {}", error.code, error.message);
+        }
+
+        // We should have 2 errors now!
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn test_error_paths() {
+        let schema = Schema::array()
+            .items(
+                Schema::object()
+                    .property("email", Schema::string().min_length(5).build())
+                    .required("email")
+                    .build(),
+            )
+            .build();
+
+        let data = json!([
+            {"email": "good@example.com"},
+            {"email": "bad"}  // Too short!
+        ]);
+
+        let result = validate(&schema, &data);
+        assert!(result.is_err());
+
+        let errors = result.unwrap_err();
+        let error = &errors[0];
+
+        // Path should be [1, "email"]
+        assert_eq!(error.path.len(), 2);
+        match &error.path[0] {
+            PathSegment::Index(i) => assert_eq!(*i, 1),
+            _ => panic!("Expected Index"),
+        }
+        match &error.path[1] {
+            PathSegment::Key(k) => assert_eq!(k, "email"),
+            _ => panic!("Expected Key"),
+        }
     }
 }
